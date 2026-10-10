@@ -1,0 +1,22 @@
+# secrets
+.env
+# local environment / caches
+.venv/
+__pycache__/
+.cache/
+# large binaries (Stockfish ~100MB, too big for a Space repo)
+stockfish/
+*.zip
+# local working files / history
+logs/
+archive/
+backup_v1/
+log1.txt
+答题情况.xlsx
+test_image.py
+cls
+*.lock
+# task attachments (binary files are rejected by HF git without Xet; not needed to run)
+attachments/
+# cached answers stay local (publishing them would leak the benchmark answer key)
+answers.json
