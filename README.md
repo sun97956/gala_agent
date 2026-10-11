@@ -1,56 +1,174 @@
----
-title: Template Final Assignment
-emoji: 🕵🏻‍♂️
-colorFrom: indigo
-colorTo: indigo
-sdk: gradio
-sdk_version: 5.25.2
-app_file: app.py
-pinned: false
-hf_oauth: true
-# optional, default duration is 8 hours/480 minutes. Max duration is 30 days/43200 minutes.
-hf_oauth_expiration_minutes: 480
----
+# GAIA Agent: a tool-using research agent for the GAIA benchmark
 
-# GAIA Agent（Hugging Face Agents Course · Unit 4 期末作业）
+**English** | [中文](README.zh-CN.md)
 
-单 agent 架构：smolagents `CodeAgent` + DeepSeek（`deepseek-flash`，文本和视觉共用）+ 12 个工具。
+A single-agent system built with [smolagents](https://github.com/huggingface/smolagents) and DeepSeek. It answers questions from the [GAIA](https://huggingface.co/gaia-benchmark) benchmark (Level 1 subset used in the Hugging Face Agents Course, Unit 4). Each question needs real research: multi-hop web lookups, reading Wikipedia tables, parsing Excel or Python attachments, transcribing audio, watching YouTube videos, or solving a chess position from an image. Answers are graded by exact match.
 
-## 文件结构
-
-| 文件 / 目录 | 作用 |
+| | |
 |---|---|
-| `app.py` | Gradio 页面：登录 HF，读取 `answers.json` 缓存，只跑没有答案的题，然后提交 |
-| `run_local.py` | 本地开发入口：单题运行、答案缓存、每题日志、本地打分、命令行提交 |
-| `agent.py` | `GAIAAgent`：附件预处理 → CodeAgent 循环 → 答案检查、清洗和兜底提取 |
-| `tools.py` | 12 个工具：搜索、网页、Wikipedia、文件、Python 执行、音频转写、看图、YouTube、象棋 |
-| `prompt.py` | 追加到 CodeAgent 系统提示后面的做题规则和答案格式规则 |
-| `requirements.txt` | 依赖 |
-| `.env.example` | 环境变量模板（复制成 `.env` 再填写，`.env` 不会上传） |
-| `questions.json` | 20 道题的缓存 |
-| `answers.json` | 每题答案的缓存（提交时用） |
-| `attachments/` | 题目附件（mp3 / xlsx / png / py） |
-| `logs/` | 每题的完整运行日志（不上传） |
-| `stockfish/` | 象棋引擎，本地使用（不上传） |
+| **Result** | `<SCORE>` / 20 on the course's GAIA Level-1 evaluation set (see [Evaluation & limitations](#evaluation--limitations)) |
+| **Stack** | Python · smolagents `CodeAgent` · DeepSeek API (`deepseek-flash`, text + vision) · faster-whisper · python-chess + Stockfish · yt-dlp + OpenCV · Gradio |
+| **Cost** | No paid APIs beyond the LLM. Search, audio, chess and video all run free or locally |
 
-## 运行
+---
+
+## Architecture
+
+```mermaid
+flowchart TD
+    A[run_local.py / app.py<br/>task selection · answer cache · per-task logs · submit] --> B
+    subgraph B[GAIAAgent.solve - agent.py]
+        B1[1. Pre-processing<br/>resolve attachment · transcribe audio<br/>attach image · inline code / table preview]
+        B2[2. CodeAgent loop, max 15 steps<br/>LLM writes Python → executed locally → observation]
+        B3[3. Post-processing<br/>answer check · normalisation · rescue extraction]
+        B1 --> B2 --> B3
+    end
+    B2 -- calls --> T
+    subgraph T[12 tools - tools.py]
+        T1[web_search · visit_webpage]
+        T2[wikipedia_search · wikipedia_page]
+        T3[read_file · run_python_file]
+        T4[transcribe_audio · analyze_image]
+        T5[youtube_transcript · analyze_youtube_video]
+        T6[chess_image_to_fen · chess_best_move]
+    end
+```
+
+The core design principle: **let code do everything that is deterministic, and let the model only decide what to do next and synthesise evidence.**
+
+| Layer | Responsibility |
+|---|---|
+| **Pre-processing** (`build_task`) | Before the agent starts, the attachment is located and its content injected: audio is transcribed, images are attached, Python source and spreadsheet previews are inlined. The model has all inputs at step 1. |
+| **Reasoning loop** | smolagents `CodeAgent`. Each step the model writes Python that calls tools or libraries (pandas, python-chess); the output becomes the next observation. |
+| **Model adapter** | `DeepSeekModel` rewrites DeepSeek's native tool-call markup into the `<code>` blocks smolagents expects. |
+| **Answer safety net** | `answer_check` rejects non-answers ("unable to determine", code, long text) and sends the agent back to work. `clean_answer` normalises format. `_rescue_answer` extracts a final answer from collected evidence if the step budget runs out. |
+| **Dev loop** | `run_local.py`: run a single task, cache answers, write a full trace per task, run tasks in parallel, score locally, submit. |
+
+### Tools
+
+| Tool | Implementation |
+|---|---|
+| `web_search` | ddgs (DuckDuckGo / Bing / Brave), with retries and a **leakage filter** (see below) |
+| `visit_webpage` | HTML → Markdown (tables preserved), PDF text extraction, paginated |
+| `wikipedia_search` / `wikipedia_page` | MediaWiki API, full article incl. tables, `as_of_date` to read a historical revision |
+| `read_file` | Excel (all sheets/rows), CSV, PDF, DOCX, PPTX, text |
+| `run_python_file` | Executes attached code in a subprocess and returns stdout |
+| `transcribe_audio` | Local faster-whisper, isolated in a child process |
+| `analyze_image` | DeepSeek vision |
+| `youtube_transcript` / `analyze_youtube_video` | Captions; or download with yt-dlp, sample frames with OpenCV, send to the vision model |
+| `chess_image_to_fen` | Board cut into 64 squares, each classified by the vision model, 3-pass majority vote, orientation from coordinate labels |
+| `chess_best_move` | Stockfish (falls back to a small built-in alpha-beta search) |
+
+---
+
+## Engineering challenges & how they were solved
+
+The first version (v1) scored poorly. I stopped tuning the prompt and **read the execution trace of every failed task**. Almost none of the failures were "the model isn't smart enough". They were infrastructure problems, which I grouped into four classes.
+
+### 1. The agent could not reach the information
+
+| Symptom (from traces) | Root cause | Fix |
+|---|---|---|
+| A discography question: 6 Wikipedia calls all returned the same intro paragraph | Tool used the REST *summary* endpoint, top-1 hit only | `wikipedia_page` returns the full parsed article incl. tables, plus `as_of_date` for "use the 2022 version" questions |
+| Research questions answered from search snippets or memory | No tool to open a page, although the prompt claimed browsing ability | `visit_webpage` (HTML/PDF → Markdown, paginated) |
+| Every search failed | Search dependency missing / renamed | Switched to `ddgs` with retries and timeouts |
+| 5 attachment questions were essentially guessed | Only images were handled; the agent was never told the file path | Pre-processing injects the absolute path plus content (transcript / source / preview) |
+| Audio questions impossible | No audio tool | Local faster-whisper |
+
+### 2. The framework was silently eating steps
+
+These never raise a visible error. They show up only in traces.
+
+| Symptom | Root cause | Fix |
+|---|---|---|
+| `regex pattern <code>(.*?)</code> was not found` | DeepSeek sometimes emits its native tool-call markup instead of a code block | Model subclass that rewrites it into a `<code>` block before parsing |
+| `Code execution exceeded the maximum execution time of 30 seconds` | smolagents' default per-snippet timeout killed audio/video/chess tools mid-run | Raised the executor timeout to 900s |
+| Long pages lost their middle part | smolagents truncates printed output above 20k chars *from the middle* | Tools paginate at 15k chars and tell the agent how to continue |
+| Process exited with no traceback on Windows | Native crash in the faster-whisper / PyAV stack | Transcription runs in a child process with `faulthandler`; a crash fails one tool call, not the run |
+| `SelectorSyntaxError` on every Wikipedia page | CSS-selector incompatibility in a bs4 dependency | Replaced selectors with plain `find_all` filters |
+| `Connection error` on every LLM call after enabling a proxy for YouTube | Proxy also captured DeepSeek traffic | `NO_PROXY` for the LLM endpoint; only YouTube goes through the proxy |
+
+### 3. The rules were forcing lost points
+
+| v1 rule | Effect | Fix |
+|---|---|---|
+| "Never output Python code" | Contradicts how `CodeAgent` works (it acts *through* code blocks): parse errors, and one answer submitted as raw code | Removed; prompt now aligned with the framework |
+| "Clearly indicate uncertainty" | 5 answers were "Unable to determine…", each a guaranteed zero | Always give the best-supported answer; non-answers are rejected by `answer_check` |
+| No output-format rules | Verbose answers failed exact match | Explicit GAIA formatting rules + `clean_answer` |
+| Post-hoc timeout | A computed answer was discarded and replaced with "TIMEOUT" | Removed; step budget and per-tool timeouts bound runtime instead |
+
+### 4. Problems that needed a different decomposition
+
+**Chess from an image.** The vision model described the whole board inconsistently (two passes disagreed on piece squares), and the LLM could not search moves. I split the task into pieces each component is good at:
+
+1. Cut the board into 64 squares and classify each one separately. Single-square classification is much easier than spatial description.
+2. Run 3 passes and take a majority vote per square. Flag disagreements.
+3. Detect orientation (white or black at the bottom) from the coordinate labels and map the grid to FEN in code.
+4. Hand the FEN to Stockfish.
+
+Result: the FEN came out exactly right and the engine found the move at step 3.
+
+**Over-verification.** With a correct engine answer in hand, the agent spent 12 more steps trying to "prove" a forced win and ended without a clean answer. Fixes: the tool output now states the result is authoritative; a prompt rule against re-verifying reliable results; and the rescue extractor as a last line of defence.
+
+### 5. Data leakage: discovered and closed
+
+After the score jumped, I audited every trace for *where* each answer first appeared. Four tasks had touched leaked sources:
+
+- benchmark mirrors on Hugging Face and GitHub;
+- other agents' published run logs;
+- auto-generated SEO pages that echo people's search queries, which sometimes include answers;
+- in one trace, the agent itself searching for "`<task_id>` GAIA answer".
+
+Mitigation, in `tools.py`:
+
+- `web_search` refuses queries that target the benchmark (its name, task-id patterns, "answer key").
+- Results and pages are dropped if they come from benchmark datasets or trace dumps, or if they contain the question text verbatim, or if they are query-echo spam.
+- The prompt forbids searching for the benchmark itself.
+
+All four affected tasks were re-run with the filter on and solved from primary sources: the original video frames, Wikipedia's featured-article log, the textbook page itself, and botanical reasoning in code. The answer cache is not published in this repo for the same reason.
+
+---
+
+## Evaluation & limitations
+
+I want this section to be read before the score.
+
+- **Tuned on the test set.** The tools were designed after seeing these 20 questions (e.g. the chess pipeline, historical Wikipedia revisions). The score therefore **overstates performance on unseen tasks**.
+- **Possible memorisation.** The questions are public; the LLM may have seen them during training. Every answer is backed by a tool trace, but a trace cannot prove the model did not "know first, then look".
+- **Leakage audit** (above) found 4 contaminated tasks; all were re-solved cleanly. Remaining risk is model memory, not retrieval.
+- **Vision counting is unstable.** On the video question, the species count varied between 2 and 3 across frame samplings. Denser sampling around key moments and per-frame structured output counted in code would be more robust.
+- **Not yet tested on held-out data.** Next step: GAIA Level 2/3 validation tasks, untouched during development.
+
+---
+
+## Project structure
 
 ```
+├── app.py            Gradio UI: HF login, submits cached answers
+├── run_local.py      Dev loop: single-task runs, answer cache, per-task logs, local scoring, submit
+├── agent.py          GAIAAgent: pre-processing, CodeAgent loop, answer check / cleaning / rescue
+├── tools.py          12 tools + leakage filter
+├── prompt.py         Instructions appended to the CodeAgent system prompt
+├── requirements.txt
+└── .env.example      DEEPSEEK_API_KEY, optional settings
+```
+
+Not committed: `.env`, answer cache, run logs, task attachments and question files (GAIA asks not to redistribute its data), Stockfish binary.
+
+## Running it
+
+```bash
 pip install -r requirements.txt
-copy .env.example .env          # 填入 DEEPSEEK_API_KEY
+cp .env.example .env            # add DEEPSEEK_API_KEY
 
-python run_local.py --list                  # 查看每题当前的答案
-python run_local.py --task 8e867cd7         # 单独跑一题（task_id 前 8 位）
-python run_local.py                         # 跑所有还没有答案的题
-python run_local.py --force                 # 全部重跑
-python app.py                               # 网页登录后提交
+python run_local.py --list          # status of all tasks
+python run_local.py --task <id>     # run one task (task-id prefix)
+python run_local.py                 # run every task without a cached answer
+python app.py                       # Gradio UI → log in → submit
 ```
 
-YouTube 题需要代理：`set HTTPS_PROXY=http://127.0.0.1:<端口>`。DeepSeek 的请求会自动绕过代理直连。
+Optional: put a Stockfish binary under `stockfish/` (auto-detected) or set `STOCKFISH_PATH`. Set `HTTPS_PROXY` if YouTube is blocked on your network; LLM traffic bypasses it automatically.
 
-## 设计要点
+## Acknowledgements
 
-- **附件预处理：** 音频先转写成文字，图片直接附上，代码和表格先放预览，模型第一步就拿到全部信息。
-- **专用工具：** 模型的弱项交给专用工具。象棋图切成 64 格分别识别、3 遍投票后得到 FEN，走法交给 Stockfish 计算。
-- **答案兜底：** 模型交出非答案会被打回重做；交上来的答案统一清洗格式；步数用完时，从工具输出里再提取一次答案。
-- **防泄露：** 搜索时过滤 benchmark 数据集、别人的运行记录和用搜索词生成的垃圾页，禁止直接搜索题目答案。
+Built for the [Hugging Face Agents Course](https://huggingface.co/learn/agents-course), Unit 4. Developed with the help of AI coding assistants for code generation and review. Diagnosis, design decisions and verification are documented above.

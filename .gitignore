@@ -20,3 +20,5 @@ cls
 attachments/
 # cached answers stay local (publishing them would leak the benchmark answer key)
 answers.json
+# GAIA asks not to redistribute its questions/files in crawlable form
+questions.json
