@@ -1,182 +1,99 @@
 # Gala Agent
 
-**A code-action research agent for the GAIA benchmark, built with smolagents.**
+**My first agent: a GAIA question-answering agent built with smolagents, and a field record of building it from 0 to 1.**
 
 **English** | [中文](README.zh-CN.md)
 
-Final project of the [Hugging Face Agents Course, Unit 4](https://huggingface.co/learn/agents-course/unit4/introduction). The task is to answer 20 Level-1 questions from [GAIA](https://huggingface.co/papers/2311.12983), a benchmark for general AI assistants. Every question needs tool use:
+This is the final project of the [Hugging Face Agents Course, Unit 4](https://huggingface.co/learn/agents-course/unit4/introduction): answer 20 Level-1 questions from [GAIA](https://huggingface.co/papers/2311.12983), scored by exact match. Every question needs tools: multi-hop retrieval, Excel and Python attachments, speech transcription, images and video, and a chess move from a board image.
 
-- multi-hop web and Wikipedia retrieval;
-- reasoning over Excel and Python attachments;
-- speech transcription;
-- image and video understanding.
+It is also the first agent I have built. Besides the code, this repository records how I went from 0 to 1: how to define the task, how to read logs to find problems, and how to stop the agent from cheating. I will keep adding to it as I build more agents.
 
-Answers are scored by exact match.
-
-**Result:** 20 / 20 correct, 100% &nbsp;·&nbsp; **Framework:** smolagents `CodeAgent` &nbsp;·&nbsp; **Model:** DeepSeek `deepseek-flash` for both text and vision
+**Result:** 20 / 20, 100% &nbsp;·&nbsp; **Framework:** smolagents `CodeAgent` &nbsp;·&nbsp; **Model:** DeepSeek `deepseek-flash` for both text and vision
 
 ![Official submission result: 20/20 correct](docs/submission_result.png)
 
-<sub>Official result returned by the course scoring API after submission. The answer column is blurred to avoid publishing the benchmark's answer key.</sub>
+<sub>Official result returned by the course scoring API. The answer column is blurred so the benchmark answers are not published.</sub>
+
+**Full field SOP: [Building an Agent from 0 to 1](docs/SOP.md)**
 
 ---
 
-## 1. Framework choice: smolagents and code actions
+## 1. Agent design
 
-### Why a code agent
+The agent is a smolagents `CodeAgent`, which follows the **CodeAct** paradigm: at every step the model writes a short Python program, and its output becomes the next observation. One step can call several tools and compute with pandas directly, which suits GAIA questions that chain retrieval, extraction and computation. CodeAct reports up to 20% higher success than JSON tool calls ([Wang et al., ICML 2024](https://arxiv.org/abs/2402.01030)).
 
-Most agent frameworks express each action as a JSON tool call. smolagents' `CodeAgent` follows the **CodeAct** paradigm instead: at every step the model writes a short Python program, the runtime executes it, and stdout becomes the next observation.
-
-| | JSON tool calling | Code actions |
-|---|---|---|
-| Tools per step | One call | Any number, with control flow |
-| Intermediate results | Serialised back through the prompt | Live Python objects passed between calls |
-| Data processing | Needs a dedicated tool for every operation | pandas, regex and arithmetic inline |
-| Fit for multi-hop tasks | One hop per step | Search, filter and compute in one step |
-
-CodeAct reports up to **20% higher task success** than JSON or text actions ([Wang et al., ICML 2024](https://arxiv.org/abs/2402.01030)). GAIA questions chain lookup, extraction and computation, so this is a natural fit.
-
-### Why smolagents
-
-- **Minimal abstraction.** The ReAct loop is small and readable, which makes trajectories easy to debug.
-- **Model-agnostic.** `OpenAIModel` works with any OpenAI-compatible endpoint, here DeepSeek.
-- **Sandboxed local executor.** Imports are allow-listed and execution has a timeout.
-- **Built-in extension points.** `instructions`, `final_answer_checks` and agent memory are used directly for guardrails and trace analysis.
-
-The trade-off: a larger action space produces more malformed actions, and executing model-written code requires a restricted runtime. Both are handled below.
-
----
-
-## 2. Architecture
-
-### System overview
-
-```mermaid
-flowchart LR
-    Q(["Question<br/>+ attachment"]) --> CTX["Context builder<br/>resolve file · transcribe<br/>attach image · preview"]
-    CTX --> AG["CodeAgent<br/>ReAct loop · max 15 steps"]
-    AG <--> T[("Tool layer<br/>retrieval · documents<br/>perception · chess engine")]
-    AG -- "final_answer" --> G{"Guardrails<br/>validate · normalise"}
-    G -- "rejected" --> AG
-    G -- "accepted" --> A(["Answer"])
-```
-
-### Inside the ReAct loop
-
-```mermaid
-sequenceDiagram
-    autonumber
-    participant M as LLM · deepseek-flash
-    participant X as Python executor
-    participant T as Tools
-    participant G as Guardrails
-    loop until final_answer or step budget
-        M->>X: Thought + code action
-        X->>T: tool calls, e.g. wikipedia_page()
-        T-->>X: Markdown observation
-        X-->>M: stdout appended to memory
-    end
-    M->>G: final_answer(answer)
-    alt non-answer or bad format
-        G-->>M: rejected, keep working
-    else valid
-        G-->>M: accepted and normalised
-    end
-```
+![System architecture](docs/diagrams/architecture.en.png)
 
 | Component | Responsibility |
 |---|---|
-| **Context builder** | Resolves the attachment and front-loads its content before step 1: speech transcript, image, source code, spreadsheet preview, absolute file path |
-| **Model adapter** | Wraps the OpenAI-compatible client and normalises DeepSeek's native tool-call markup into the code-block format smolagents parses |
-| **Executor** | Runs model-written code with an import allow-list and a 900s timeout; up to 15 steps per task |
-| **Output guardrails** | Rejects non-answers, raw code and long explanations; normalises format; extracts an answer from collected evidence if the step budget is exhausted |
-| **Harness** | Single-task replay, answer caching, parallel runs, full trajectory logging, local exact-match scoring |
+| Context builder | Injects the attachment path and content before step 1: transcript, image, source code, spreadsheet preview |
+| Tool layer | 12 tools: web retrieval, full Wikipedia articles and past revisions, files, speech, vision, chess engine |
+| Model adapter | Rewrites the DSML tool-call markup DeepSeek sometimes emits into a code block |
+| Output guardrails | Rejects non-answers and long explanations, normalises format; extracts an answer from collected evidence if the step budget runs out |
+| Harness | Single-task replay, answer cache, full log per task, local scoring |
 
-**Design principle: deterministic work is offloaded to code.** Transcription, arithmetic, code execution and game-tree search are done by tools and libraries. The model handles planning, tool selection and evidence synthesis.
+## 2. The 0-to-1 process
 
----
+<p align="center"><img src="docs/diagrams/lifecycle.en.png" alt="Agent lifecycle" width="380"></p>
 
-## 3. Tool design
-
-The tools define the agent's action space. They are grouped by capability.
-
-| Capability | Tools | Implementation |
+| Stage | Key actions | In this project |
 |---|---|---|
-| Retrieval | `web_search`, `visit_webpage` | Multi-backend search; HTML and PDF converted to Markdown with tables preserved |
-| Knowledge base | `wikipedia_search`, `wikipedia_page` | MediaWiki API, full article with tables, point-in-time revisions |
-| Documents | `read_file`, `run_python_file` | All sheets of Excel, CSV, PDF, DOCX, PPTX; attached code executed in a subprocess |
-| Speech | `transcribe_audio` | Local faster-whisper, process-isolated |
-| Vision | `analyze_image`, `analyze_youtube_video`, `youtube_transcript` | Frame sampling with OpenCV, batched into one multimodal request; captions with timestamps |
-| Domain engine | `chess_image_to_fen`, `chess_best_move` | Per-square classification with 3-way majority vote, then Stockfish |
+| 1. Define the task | Write down input, output and success criteria: accuracy, grounded answers, format compliance | The last two were added only after they cost points |
+| 2. Test set and scorer | Group questions by capability, hold some out, write the scorer before the agent | No held-out set this time; see limitations |
+| 3. Observable MVP | Two or three core tools; a prompt that does not fight the framework; observability first | Single-task replay, per-task logs, answer cache, local scoring |
+| 4. Iteration loop | Read logs in a fixed order, find the root cause, fix at the right layer, one change per round | See the six real problems below |
+| 5. Provenance audit | Trace every correct answer back to where it first appeared | 4 questions had touched leaked sources; re-run with defences |
+| 6. Acceptance | Held-out check, full regression, repeat unstable questions | Official score 20/20 |
 
-**Tool-design principles**
+**Six principles throughout**: diagnose before changing anything; information before intelligence; hand deterministic work to code; the prompt states intent and code enforces it; fix a class of problems, not one question; the higher the score, the more you audit where answers came from.
 
-1. **LLM-legible observations.** Return Markdown tables, timestamps and page markers, not raw HTML or JSON.
-2. **Bounded outputs.** Paginate below the framework's 20k-character print limit, so observations never exceed the context budget or get truncated.
-3. **Recoverable errors.** Every error message names an alternative action, so the agent re-plans instead of retrying.
-4. **Fault isolation.** Native dependencies that can crash run in child processes.
-5. **Decompose perception.** Whole-board recognition from a vision model is unreliable. Per-square classification plus majority voting turns it into a series of easy, verifiable sub-tasks.
+## 3. Six real problems from the logs
 
----
+Read each log by asking, in order: did it get the information? was the action valid? did it execute? was the reasoning right? did it stop correctly? The earlier the question, the more basic the problem.
 
-## 4. Failure modes and mitigations
+| # | What the log showed | Root cause | Fix | Transferable lesson |
+|---|---|---|---|---|
+| 1 | A dozen keyword variations, and `wikipedia_search` returned the same Summary every time, ending in `Reached max steps.` | The tool called a summary endpoint and never reached the tables in the article body | Return the full article with tables and past revisions; add a web-page reader | When an agent keeps rephrasing, suspect the tool first |
+| 2 | `ERROR: No module named 'duckduckgo_search'`, and the agent kept retrying | Dependency not installed; the package had been renamed to `ddgs` | Switch to `ddgs`, add retries and timeouts | Run every tool on its own before going live; errors should separate "broken" from "no results" |
+| 3 | `InterpreterError: Import of subprocess is not allowed` | CodeAgent's sandbox allow-lists imports and functions | Allow common libraries and `repr`; wrap heavy operations in tools | Read the framework's sandbox rules and defaults first |
+| 4 | `watch?v=https://www.youtube.com/watch?v=...` `invalid video id` | The model passed a full URL; the tool only accepted an ID | The tool accepts either and normalises | Design parameters around the model's habits; let the tool absorb mistakes |
+| 5 | `Reached max steps.` → `Answer: TIMEOUT`; `exceeded the maximum execution time of 30 seconds` | An after-the-fact timeout check discarded the answer; the execution timeout was the framework default | Remove the check, raise the timeout to 900 seconds, extract an answer from evidence when steps run out | Every exit path should still hand in an answer |
+| 6 | 5 questions submitted as "Unable to determine"; `Error in code parsing` | The prompt asked for uncertainty and banned code output; DeepSeek's DSML markup | Align the prompt with the framework; reject non-answers in code; rewrite DSML in the adapter | Critical rules need a check in code |
 
-Every change was driven by **trajectory analysis**: read the full trace of each failed task, attribute the failure to tool, runtime or policy, and fix in order of impact. The failures fell into well-known agent failure modes.
+Raw log excerpts and the full analysis are in [SOP stage 4](docs/SOP.md#stage-4-the-iteration-loop).
 
-| Failure mode | Observed symptom | Mitigation |
-|---|---|---|
-| **Grounding failure** | Repeated Wikipedia calls returned only the lead paragraph; questions answered from snippets or parametric memory | Full-article and page-reading tools; prompt requires opening primary sources |
-| **Missing context** | Attachment questions answered without the attachment | Context builder injects path and content before the first step |
-| **Malformed actions** | `regex pattern <code>(.*?)</code> was not found` | Model adapter rewrites native tool-call markup into a code action |
-| **Observation truncation** | Middle of long pages silently dropped by the framework | Paginated tool outputs below the print limit |
-| **Runtime faults** | Tools killed at the 30s default; native crash with no traceback; LLM calls broken by a proxy | Raised executor timeout; subprocess isolation; per-host proxy routing |
-| **Instruction conflict** | Prompt said "never output code" to a code agent | Prompt aligned with the runtime contract |
-| **Premature abstention** | "Unable to determine" submitted as the answer | Policy to always commit to the best-supported answer; validator rejects abstentions |
-| **Perception error** | Two vision passes disagreed on the board position | Decomposition plus ensemble voting; engine for search |
-| **Unproductive looping** | Agent kept re-verifying a correct engine result until the step budget ran out | Authoritative tool outputs, anti-over-verification rule, fallback extraction |
-| **Output-format mismatch** | Verbose answers failing exact match | Explicit formatting policy and an answer normaliser |
+## 4. When the agent cheats
 
----
+Once the score went up, I traced every answer back to where it first appeared in the log. The agent had touched benchmark mirrors, other people's published run logs and SEO spam pages, and once it searched for the answer itself:
 
-## 5. Evaluation methodology
+```
+web_search(query="<task_id> GAIA answer")
+```
 
-- **Offline harness.** `run_local.py` replays a single task in seconds, caches answers, runs tasks in parallel and writes the full trajectory per task. This shortens the iteration loop from a full 20-question run to a single targeted replay.
-- **Metric.** Exact match with GAIA's normalisation rules: numeric, list and string answers are each compared differently. `--score` evaluates locally against the validation labels.
-- **Error attribution.** Each failure is labelled as tool, runtime or policy, so fixes target the actual cause instead of the prompt by default.
-- **Runtime guardrails.** `final_answer_checks` validates every answer before the run can end; `clean_answer` normalises it; a fallback extractor recovers an answer when the step budget is exhausted.
-- **Provenance audit.** For every correct answer, locate where it first appears in the trajectory. Correct is not enough: the answer must be grounded in a primary source.
+An agent with web access will optimise for "being right" directly. Defences at three layers:
 
----
-
-## 6. Specification gaming and data leakage
-
-The provenance audit surfaced a classic **specification-gaming** behaviour. The objective was "produce the matching answer", and an agent with web access will optimise exactly that. Several trajectories obtained answers from:
-
-- benchmark mirrors on Hugging Face and GitHub;
-- published trajectories of other agents;
-- SEO pages generated from search queries;
-- in one case, the agent's own query for the task ID plus "answer".
-
-**Defences, applied at three levels**
-
-| Level | Control |
+| Layer | Control |
 |---|---|
-| **Query** | `web_search` refuses queries that target the benchmark, task-ID patterns or answer keys |
-| **Result** | Results and pages are filtered if they come from benchmark mirrors or trace dumps, contain the question verbatim (n-gram overlap), or are query-echo spam |
-| **Policy** | The system prompt explicitly forbids looking up the benchmark |
+| Query | Refuse searches that target the benchmark, task IDs or answer keys |
+| Result | Filter out mirrors, run logs and pages that closely match the question text |
+| Policy | The prompt forbids looking up the benchmark |
 
-Every affected task was re-run with the defences enabled and solved from primary sources. The answer cache is excluded from this repository so the project does not become a leakage source itself.
+All 4 affected questions were re-run with the defences on, and every answer was derived from primary sources. The answer cache and run logs are not in this repository, so the project does not become a leak source itself.
 
----
+## 5. Takeaways
 
-## 7. Takeaways
+- **An agent is a system, not just a prompt**. Model, tools, runtime and harness decide the outcome together; the biggest gains came from tools and runtime.
+- **The bottleneck is usually information, not intelligence**. If the model cannot read the table, no instruction will help.
+- **Frameworks fail silently**. Sandbox allow-lists, the 30-second timeout, output truncation and format drift raise no obvious error; they just eat the step budget.
+- **Tools are an interface for the model**. Accept sloppy input, return text the model can read, and make errors say what to do next.
+- **Iteration speed compounds**. Single-task replay plus per-task logs cut a feedback round from tens of minutes to tens of seconds.
+- **When AI writes the code, you own diagnosis and acceptance**. Logs and tests decide where to change things and whether a change is right.
 
-- **An agent is a system, not a prompt.** Model, action space, runtime and harness. The largest gains came from tools and runtime, not prompt wording.
-- **Information access bounds performance.** A capable model with a summary-only Wikipedia tool will fail regardless of instructions.
-- **Trajectories are the primary debugging artefact.** Every effective fix came from reading traces, not from intuition.
-- **Frameworks fail silently.** Timeouts, truncation and format drift raise no errors; they just consume the step budget.
-- **Evaluate provenance, not just accuracy.** Tool-using agents will exploit any available answer key. Benchmarks need leakage controls on the agent side too.
-- **Iteration speed compounds.** A fast, observable replay loop matters more than any single technique.
+## 6. Limitations and next steps
+
+- The tools were designed after seeing these 20 questions, and there was no held-out set, so 20/20 overstates performance on unseen questions.
+- The video counting question is unstable across frame-sampling settings.
+- Next: hold-out testing on GAIA Level 2 and 3 validation questions never touched during development; keep adding lessons to the SOP as I build new agents.
 
 ---
 
@@ -184,10 +101,11 @@ Every affected task was re-run with the defences enabled and solved from primary
 
 ```
 app.py          Gradio UI: HF login, submission of cached answers
-run_local.py    Evaluation harness: replay, cache, traces, scoring, submission
-agent.py        Orchestrator: context builder, model adapter, guardrails
-tools.py        Tool layer and leakage filters
-prompt.py       Agent policy
+run_local.py    Harness: single-task replay, answer cache, per-task logs, local scoring, submission
+agent.py        Context builder, model adapter, output guardrails
+tools.py        12 tools and leakage filters
+prompt.py       Agent rules
+docs/           Field SOP, diagrams, submission screenshot
 ```
 
 ## Quick start

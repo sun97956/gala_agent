@@ -1,0 +1,18 @@
+sequenceDiagram
+    autonumber
+    participant M as LLM<br/>deepseek-flash
+    participant X as Python executor
+    participant T as Tools
+    participant G as Guardrails
+    loop until final_answer or step budget
+        M->>X: Thought + code action
+        X->>T: tool calls, e.g. wikipedia_page()
+        T-->>X: Markdown observation
+        X-->>M: stdout appended to memory
+    end
+    M->>G: final_answer(answer)
+    alt non-answer or bad format
+        G-->>M: rejected, keep working
+    else valid
+        G-->>M: accepted and normalised
+    end

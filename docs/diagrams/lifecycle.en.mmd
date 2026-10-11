@@ -1,0 +1,9 @@
+flowchart TD
+    S1["① Define the task<br/>I/O · success criteria"] --> S2["② Test set and scorer<br/>by capability · held-out"]
+    S2 --> S3["③ Observable MVP<br/>core tools · replay · logs"]
+    S3 --> S4["④ Iteration loop<br/>read logs → root cause<br/>→ fix → re-run"]
+    S4 -- "one change per round" --> S4
+    S4 --> S5["⑤ Audit answer provenance"]
+    S5 -- "leak found:<br/>add defence, re-run" --> S4
+    S5 --> S6["⑥ Acceptance<br/>held-out · full regression"]
+    style S4 fill:#e7f0fb,stroke:#2f6fd6,stroke-width:2px

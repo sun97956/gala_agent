@@ -1,0 +1,7 @@
+flowchart LR
+    Q(["Question<br/>+ attachment"]) --> CTX["Context builder<br/>resolve file · transcribe<br/>attach image · preview"]
+    CTX --> AG["CodeAgent<br/>ReAct loop · max 15 steps"]
+    AG <--> T[("Tool layer<br/>retrieval · documents<br/>perception · chess engine")]
+    AG -- "final_answer" --> G{"Guardrails<br/>validate · normalise"}
+    G -- "rejected" --> AG
+    G -- "accepted" --> A(["Answer"])

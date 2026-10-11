@@ -1,0 +1,18 @@
+sequenceDiagram
+    autonumber
+    participant M as LLM<br/>deepseek-flash
+    participant X as Python 执行器
+    participant T as 工具
+    participant G as 输出防护
+    loop 直到 final_answer 或步数用尽
+        M->>X: 思考 + 代码行动
+        X->>T: 调用工具，如 wikipedia_page()
+        T-->>X: Markdown 格式的观察结果
+        X-->>M: 输出写入 memory
+    end
+    M->>G: final_answer(answer)
+    alt 非答案或格式错误
+        G-->>M: 驳回，继续工作
+    else 合格
+        G-->>M: 通过并规范化
+    end
