@@ -1,123 +1,210 @@
 # Gala Agent
 
+**基于 smolagents 与 Code Action 范式的研究型 agent，面向 GAIA benchmark。**
+
 [English](README.md) | **中文**
 
-[Hugging Face Agents Course 第 4 单元](https://huggingface.co/learn/agents-course/zh-CN/unit4/introduction)的期末项目：做一个 agent，回答 [GAIA](https://huggingface.co/gaia-benchmark) benchmark 的 20 道题。每道题都需要真的动手：多跳网页检索、读 Wikipedia 表格、分析 Excel 或 Python 附件、转写音频、看 YouTube 视频，或者根据棋盘图片下一步棋。评分方式是精确匹配。
+[Hugging Face Agents Course 第 4 单元](https://huggingface.co/learn/agents-course/zh-CN/unit4/introduction)的期末项目。任务是回答 [GAIA](https://huggingface.co/papers/2311.12983) 的 20 道 Level 1 题目。GAIA 是面向通用 AI 助手的评测基准，每道题都必须借助工具完成：
 
-**成绩：** `<SCORE>` / 20  
-**技术栈：** smolagents · DeepSeek `deepseek-flash` 负责文本和视觉 · faster-whisper · Stockfish · yt-dlp · OpenCV · Gradio
+- 多跳的网页与 Wikipedia 检索；
+- 基于 Excel、Python 附件的推理；
+- 语音转写；
+- 图像与视频理解。
+
+评分方式为精确匹配。
+
+**成绩：** 20 / 20 全部正确，得分 100% &nbsp;·&nbsp; **框架：** smolagents `CodeAgent` &nbsp;·&nbsp; **模型：** DeepSeek `deepseek-flash`，文本与视觉共用
+
+![官方提交结果：20/20 全部正确](docs/submission_result.png)
+
+<sub>提交后课程评分接口返回的官方结果。答案列已做模糊处理，避免公开 benchmark 的答案。</sub>
 
 ---
 
-## 1. Agent 设计
+## 1. 框架选型：smolagents 与代码行动
 
-**框架。** agent 基于 smolagents 的 `CodeAgent`。模型每一步写的是一段 Python，而不是 JSON 格式的工具调用。一步之内就能调用多个工具、循环处理结果、用 pandas 计算，很适合 GAIA 这种多跳题目。
+### 为什么选代码 agent
+
+多数 agent 框架用 JSON 格式的工具调用表达每一步行动。smolagents 的 `CodeAgent` 采用的是 **CodeAct** 范式：模型每一步写一段 Python，运行时执行这段代码，标准输出作为下一步的观察结果。
+
+| | JSON 工具调用 | 代码行动 |
+|---|---|---|
+| 每步可调用的工具 | 一次一个 | 任意多个，并支持控制流 |
+| 中间结果 | 序列化后经由 prompt 回传 | 以 Python 对象直接在调用间传递 |
+| 数据处理 | 每种操作都需要专门的工具 | 直接用 pandas、正则、算术 |
+| 多跳任务 | 每步只能前进一跳 | 一步内完成检索、筛选和计算 |
+
+CodeAct 论文报告其任务成功率比 JSON 或文本形式的行动最高提升 **20%**（[Wang et al., ICML 2024](https://arxiv.org/abs/2402.01030)）。GAIA 题目往往需要把检索、抽取和计算串起来，正适合这种范式。
+
+### 为什么选 smolagents
+
+- **抽象层薄。** ReAct 循环的实现小而清晰，执行轨迹容易调试。
+- **与模型解耦。** `OpenAIModel` 可以接入任何兼容 OpenAI 接口的服务，这里接的是 DeepSeek。
+- **自带沙箱执行器。** import 采用白名单，代码执行有超时限制。
+- **扩展点齐全。** `instructions`、`final_answer_checks` 和 agent memory 直接用来实现防护和轨迹分析。
+
+代价是：行动空间更大，模型更容易产出格式错误的行动；执行模型写的代码，也需要受限的运行环境。这两点在下文都有对应处理。
+
+---
+
+## 2. 系统架构
+
+### 整体流程
 
 ```mermaid
 flowchart LR
-    Q[题目 + 附件] --> P[预处理]
-    P --> L[CodeAgent 循环<br/>模型写 Python]
-    L <--> T[12 个工具]
-    L --> C[答案检查<br/>和格式清洗]
-    C --> A[最终答案]
+    Q(["题目<br/>+ 附件"]) --> CTX["上下文构建<br/>定位文件 · 语音转写<br/>附加图片 · 内容预览"]
+    CTX --> AG["CodeAgent<br/>ReAct 循环 · 最多 15 步"]
+    AG <--> T[("工具层<br/>检索 · 文档<br/>感知 · 象棋引擎")]
+    AG -- "final_answer" --> G{"输出防护<br/>校验 · 规范化"}
+    G -- "驳回" --> AG
+    G -- "通过" --> A(["答案"])
 ```
 
-**三条设计原则**
+### ReAct 循环内部
 
-1. **第一步就把信息给全。** 循环开始前先处理附件：音频转成文字，图片直接附上，代码和表格放预览，文件路径写进题目。
-2. **确定的事交给代码。** 转写、表格计算、运行附件代码、象棋搜索，都由工具和库完成，不让模型"心算"。
-3. **模型负责决策和整合。** 它只决定下一步做什么，再把证据整合成答案。
+```mermaid
+sequenceDiagram
+    autonumber
+    participant M as LLM · deepseek-flash
+    participant X as Python 执行器
+    participant T as 工具
+    participant G as 输出防护
+    loop 直到 final_answer 或步数用尽
+        M->>X: 思考 + 代码行动
+        X->>T: 调用工具，如 wikipedia_page()
+        T-->>X: Markdown 格式的观察结果
+        X-->>M: 输出写入 memory
+    end
+    M->>G: final_answer(answer)
+    alt 非答案或格式错误
+        G-->>M: 驳回，继续工作
+    else 合格
+        G-->>M: 通过并规范化
+    end
+```
 
-## 2. 工具设计
+| 组件 | 职责 |
+|---|---|
+| **上下文构建** | 在第一步之前定位附件并预先注入内容：转写文本、图片、源码、表格预览、文件绝对路径 |
+| **模型适配层** | 封装兼容 OpenAI 的客户端，把 DeepSeek 原生的工具调用标记转换成 smolagents 能解析的代码块 |
+| **执行器** | 在 import 白名单和 900 秒超时的约束下执行模型代码，每题最多 15 步 |
+| **输出防护** | 驳回非答案、原始代码和长篇解释；规范答案格式；步数用尽时从已收集的证据中提取答案 |
+| **评测框架** | 单题回放、答案缓存、并行运行、完整轨迹日志、本地精确匹配打分 |
 
-| 类别 | 工具 | 设计要点 |
-|---|---|---|
-| 网页 | `web_search`、`visit_webpage` | 网页转成保留表格的 Markdown，支持 PDF，长页面分页 |
-| Wikipedia | `wikipedia_search`、`wikipedia_page` | 读全文和表格，可以读取指定日期的历史版本 |
-| 文件 | `read_file`、`run_python_file` | Excel 读全部工作表和行，附件代码真实运行 |
-| 音频 | `transcribe_audio` | 本地 Whisper，放在子进程里运行 |
-| 视觉 | `analyze_image`、`analyze_youtube_video` | 视频抽帧后一次性交给视觉模型 |
-| 视频字幕 | `youtube_transcript` | 带时间戳的字幕 |
-| 象棋 | `chess_image_to_fen`、`chess_best_move` | 棋盘切成 64 格、3 遍投票，再交给 Stockfish |
-
-**写工具的几条原则**
-
-- **返回模型读得懂的文本。** 用 Markdown 表格、时间戳和页码标记，不直接返回原始 HTML 或 JSON。
-- **失败时给出下一步。** 报错信息里写明可以改用什么方法，让 agent 换思路，而不是原样重试。
-- **适配框架的限制。** 输出按框架的打印上限分页，慢工具的耗时控制在执行时限内。
-- **隔离不稳定的依赖。** 可能崩溃的底层库放进子进程，单次失败不会拖垮整个运行。
-- **把难的感知任务拆开。** 让视觉模型描述整张棋盘不可靠，一次只判断一个格子、再投票，就可靠了。
-
-## 3. 遇到的问题和解决
-
-每一处修改都来自读失败题目的执行日志。
-
-| 日志里看到的现象 | 原因 | 解决 |
-|---|---|---|
-| 反复查 Wikipedia，返回的都是同一段简介 | 工具调用的是摘要接口 | 改为获取解析后的全文 |
-| 附件题基本靠猜 | agent 根本不知道附件路径 | 预处理时写入路径和内容 |
-| 大量回答 "Unable to determine" | prompt 要求模型表达不确定 | 始终给出依据最充分的答案，拦截非答案 |
-| 解析报错：找不到 `<code>` 代码块 | DeepSeek 有时用自己的工具调用格式 | 模型适配层把它改写成代码块 |
-| 工具运行到一半被杀掉 | 每段代码默认只给 30 秒 | 放宽执行时限 |
-| 长网页中间的内容悄悄丢失 | 框架会截掉超过 2 万字符的输出 | 工具输出按 1.5 万字符分页 |
-| Windows 上进程直接退出、没有报错 | 音频相关的底层库原生崩溃 | 转写放进子进程 |
-| 开代理后每次调用模型都失败 | 代理把模型请求也拦了 | 只让 YouTube 走代理 |
-| 棋盘识别前后不一致 | 视觉模型不擅长描述整张棋盘 | 逐格识别加投票，走法交给 Stockfish |
-| 已拿到正确的引擎结果，还在反复验证直到步数用完 | 过度验证 | 工具输出写明结果可信，prompt 禁止重复验证，兜底提取答案 |
-
-## 4. 怎么评估 agent 的输出
-
-- **本地按精确匹配打分。** `run_local.py --score` 采用 GAIA 的归一化规则，数字、列表、字符串各有不同的比较方式。
-- **每题都有完整日志。** 每次运行记录每一步。失败原因按工具、框架、prompt 三类归档，按影响大小依次修。
-- **守住最终答案。** 非答案、代码、长篇解释都会被打回，agent 继续工作；答案统一清洗格式；步数用完时，从已收集的证据里提取答案。
-- **审查证据来源。** 对每个答案，都在日志里查它最早从哪里出现。正确答案必须来自原始资料，而不是来自本来就写着答案的地方。
-
-## 5. 当 agent 作弊时
-
-证据审查发现，有些答对的题，答案来自不该来的地方：
-
-- Hugging Face 和 GitHub 上转载 benchmark 的数据集；
-- 别人公开的 agent 运行记录；
-- 用别人的搜索词自动生成的 SEO 页面；
-- 有一条日志里，agent 自己去搜了"task ID + answer"。
-
-**应对措施**
-
-- `web_search` 拒绝针对 benchmark 或 task ID 的搜索。
-- 来自 benchmark 转载和运行记录的结果，以及原样包含题目文字的页面，都会被过滤。
-- prompt 明确禁止查找 benchmark 本身。
-- 受影响的题开启过滤后全部重跑，都从原始资料得出答案：视频本身、Wikipedia 特色条目记录、教材原文。
-- 答案缓存不公开，这个仓库本身也不会变成泄露源。
-
-## 6. 对 agent 的理解
-
-- **Agent 不只是 prompt。** 它是模型、工具、循环，再加上外围的工程。大部分提升来自工具和外围工程，而不是 prompt 措辞。
-- **瓶颈在信息，不在智力。** 模型读不到表格时，指令写得再好也没用。
-- **先看日志，再动手。** 这里每一个真正有效的修复都来自日志，而不是猜测。
-- **框架会悄悄出错。** 超时、截断、格式不匹配都不会报错，只会默默消耗步数。
-- **高分需要审查。** 能上网的 agent，只要答案存在就会找到它。评估时必须检查答案从哪里来。
-- **快速反馈比技巧更重要。** 单题运行、答案缓存、每题日志，让几小时的瞎猜变成每轮几分钟的迭代。
+**设计原则：确定性的工作交给代码。** 转写、计算、代码执行、博弈树搜索都由工具和库完成，模型只负责规划、选择工具和综合证据。
 
 ---
 
-## 项目结构
+## 3. 工具设计
+
+工具集合定义了 agent 的行动空间，按能力划分如下：
+
+| 能力 | 工具 | 实现 |
+|---|---|---|
+| 检索 | `web_search`、`visit_webpage` | 多后端搜索；网页和 PDF 转为保留表格的 Markdown |
+| 知识库 | `wikipedia_search`、`wikipedia_page` | MediaWiki API，含表格的全文，支持按日期读取历史版本 |
+| 文档 | `read_file`、`run_python_file` | Excel 全部工作表、CSV、PDF、DOCX、PPTX；附件代码在子进程中执行 |
+| 语音 | `transcribe_audio` | 本地 faster-whisper，进程隔离 |
+| 视觉 | `analyze_image`、`analyze_youtube_video`、`youtube_transcript` | OpenCV 抽帧后合并为一次多模态请求；带时间戳的字幕 |
+| 领域引擎 | `chess_image_to_fen`、`chess_best_move` | 逐格分类加三次多数投票，再交给 Stockfish |
+
+**工具设计原则**
+
+1. **观察结果要便于 LLM 理解。** 返回 Markdown 表格、时间戳和页码标记，不返回原始 HTML 或 JSON。
+2. **输出有界。** 分页长度低于框架 2 万字符的打印上限，观察结果不会超出上下文预算，也不会被截断。
+3. **错误可恢复。** 每条报错都给出可替代的行动，让 agent 重新规划，而不是原样重试。
+4. **故障隔离。** 可能崩溃的底层依赖运行在子进程中。
+5. **拆解感知任务。** 让视觉模型识别整张棋盘并不可靠；逐格分类再多数投票，就变成了一串简单、可验证的子任务。
+
+---
+
+## 4. 失败模式与对策
+
+所有改动都来自**轨迹分析**：逐题阅读失败任务的完整执行轨迹，把原因归到工具、运行时或策略三类，再按影响大小依次修复。遇到的问题基本对应几种常见的 agent 失败模式：
+
+| 失败模式 | 观察到的现象 | 对策 |
+|---|---|---|
+| **信息落地失败** | 多次调用 Wikipedia 只拿到导语段；靠搜索摘要或模型参数记忆作答 | 提供全文和网页读取工具；策略要求查阅原始来源 |
+| **上下文缺失** | 附件题在没看到附件的情况下作答 | 上下文构建在第一步之前注入路径和内容 |
+| **行动格式错误** | `regex pattern <code>(.*?)</code> was not found` | 模型适配层把原生工具调用标记改写为代码行动 |
+| **观察结果截断** | 长网页中段被框架静默丢弃 | 工具输出分页，低于打印上限 |
+| **运行时故障** | 工具在默认 30 秒处被终止；底层库崩溃且无报错；代理导致模型调用中断 | 放宽执行超时；子进程隔离；按域名分流代理 |
+| **指令冲突** | prompt 要求代码 agent "不要输出代码" | 让 prompt 与运行时约定保持一致 |
+| **过早放弃作答** | 提交 "Unable to determine" 作为答案 | 策略要求给出依据最充分的答案；校验器驳回放弃式回答 |
+| **感知错误** | 两次视觉识别对棋局的判断不一致 | 任务拆解加集成投票；走法交给引擎搜索 |
+| **无效循环** | 已拿到正确的引擎结果，仍反复验证直至步数耗尽 | 工具输出标明结果权威；禁止过度验证；兜底提取答案 |
+| **输出格式不匹配** | 冗长的回答无法精确匹配 | 明确的格式策略加答案规范化 |
+
+---
+
+## 5. 评测方法
+
+- **离线评测框架。** `run_local.py` 可在几秒内回放单题，缓存答案，并行运行，并为每题写下完整轨迹。迭代单位从"整套 20 题"缩短为"有针对性地回放一题"。
+- **指标。** 采用 GAIA 归一化规则的精确匹配，数字、列表、字符串分别比较。`--score` 可在本地对照验证集标签打分。
+- **错误归因。** 每个失败都标注为工具、运行时或策略问题，修复针对真正原因，而不是默认去改 prompt。
+- **运行时防护。** `final_answer_checks` 在运行结束前校验每个答案；`clean_answer` 统一格式；步数耗尽时由兜底提取器恢复答案。
+- **溯源审查。** 对每个答对的题，定位答案在轨迹中最早出现的位置。答对还不够，答案必须有原始来源作为依据。
+
+---
+
+## 6. 规约博弈与数据泄露
+
+溯源审查发现了典型的**规约博弈**（specification gaming）行为：目标是"给出匹配的答案"，一个能上网的 agent 就会直接优化这个目标。部分轨迹的答案来自：
+
+- Hugging Face 与 GitHub 上的 benchmark 转载；
+- 其他 agent 公开的运行轨迹；
+- 根据搜索词自动生成的 SEO 页面；
+- 有一次，agent 自己去搜索"task ID + answer"。
+
+**三层防护**
+
+| 层级 | 措施 |
+|---|---|
+| **查询层** | `web_search` 拒绝针对 benchmark、task ID 格式或答案表的搜索 |
+| **结果层** | 过滤来自 benchmark 转载和轨迹转储的结果、通过 n-gram 重叠检测出的原样包含题目文字的页面，以及回显搜索词的垃圾页 |
+| **策略层** | 系统提示明确禁止查找 benchmark 本身 |
+
+所有受影响的题目都在启用防护后重跑，并从原始来源得出答案。答案缓存不纳入本仓库，避免项目本身成为泄露源。
+
+---
+
+## 7. 总结与思考
+
+- **Agent 是一个系统，不是一段 prompt。** 它由模型、行动空间、运行时和评测框架共同组成。最大的提升来自工具与运行时，而不是 prompt 措辞。
+- **信息获取决定能力上限。** 一个只能读到 Wikipedia 摘要的强模型，无论指令写得多好都会失败。
+- **执行轨迹是首要的调试依据。** 每一个有效修复都来自阅读轨迹，而不是直觉。
+- **框架会静默失败。** 超时、截断、格式漂移都不会报错，只会悄悄消耗步数预算。
+- **既要评估准确率，也要评估来源。** 能使用工具的 agent 会利用任何可得的答案表，因此 agent 一侧同样需要防泄露机制。
+- **迭代速度会复利。** 一个快速、可观测的回放循环，比任何单项技巧都更重要。
+
+---
+
+## 仓库结构
 
 ```
-app.py          Gradio 页面：登录并提交缓存的答案
-run_local.py    开发循环：单题运行、答案缓存、日志、本地打分
-agent.py        预处理、CodeAgent 循环、答案检查
-tools.py        12 个工具和防泄露过滤
-prompt.py       agent 的指令
+app.py          Gradio 页面：HF 登录，提交缓存答案
+run_local.py    评测框架：回放、缓存、轨迹、打分、提交
+agent.py        编排层：上下文构建、模型适配、输出防护
+tools.py        工具层与防泄露过滤
+prompt.py       agent 策略
 ```
 
 ## 快速开始
 
 ```bash
 pip install -r requirements.txt
-cp .env.example .env           # 填入 DEEPSEEK_API_KEY
-python run_local.py --task <id>
-python run_local.py --list
-python app.py
+cp .env.example .env              # 设置 DEEPSEEK_API_KEY
+python run_local.py --task <id>   # 回放单题
+python run_local.py --list        # 查看所有题目状态
+python app.py                     # 登录并提交
 ```
 
-可选：把 Stockfish 放在 `stockfish/` 下。如果网络访问不了 YouTube，设置 `HTTPS_PROXY`。
+可选：把 Stockfish 放在 `stockfish/` 目录下。如果访问不了 YouTube，设置 `HTTPS_PROXY`，模型请求会自动绕过代理。
+
+## 参考
+
+- Wang et al., [Executable Code Actions Elicit Better LLM Agents](https://arxiv.org/abs/2402.01030), ICML 2024
+- Mialon et al., [GAIA: a benchmark for General AI Assistants](https://huggingface.co/papers/2311.12983), 2023
+- [smolagents 文档](https://huggingface.co/docs/smolagents)
+- [Hugging Face Agents Course](https://huggingface.co/learn/agents-course)
